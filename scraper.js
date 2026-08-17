@@ -1,170 +1,160 @@
 /**
- * scraper.js — HTTP client for comix.to with Persistent Playwright Session & Auto-Refresh.
+ * scraper.js — Persistent Playwright Browser for comix.to scraping (VPS / RDP Mode).
+ *
+ * Architecture:
+ *   1 Playwright browser stays alive in background.
+ *   All API calls run inside browser via page.evaluate(fetch(...)).
+ *   Cloudflare sees real Chrome TLS + cookies -> 0% chance of 403.
  */
 
 'use strict';
 
-const axios = require('axios');
+const dns = require('dns');
 const { chromium } = require('playwright-chromium');
 const { getSignature, decryptResponse } = require('./crypto');
-const db = require('./db');
+
+// DNS Override for ISP filters (e.g. Internet Positif)
+const origLookup = dns.lookup;
+dns.lookup = function (hostname, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  if (hostname === 'comix.to' || hostname.endsWith('.comix.to')) {
+    if (options && options.all) return callback(null, [{ address: '172.67.152.235', family: 4 }]);
+    return callback(null, '172.67.152.235', 4);
+  }
+  return origLookup(hostname, options, callback);
+};
 
 const BASE = 'https://comix.to';
-let cookiesHeader = '';
-let userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-let isRefreshing = null;
+let browser = null;
+let page = null;
+let browserReady = null;
 
-// Initialize session from DB or Browser
-async function refreshSession() {
-  if (isRefreshing) return isRefreshing;
-  isRefreshing = (async () => {
-    console.log('[Session] Refreshing Cloudflare Turnstile token via browser...');
-    try {
-      const browser = await chromium.launch({
-        headless: false,
-        args: ['--disable-blink-features=AutomationControlled']
-      });
-      const context = await browser.newContext();
-      const page = await context.newPage();
-      await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      });
-
-      await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      await page.waitForTimeout(6000);
-
-      const cookies = await context.cookies();
-      cookiesHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-      userAgent = await page.evaluate(() => navigator.userAgent);
-
-      await browser.close();
-      await db.saveToken(cookiesHeader, userAgent);
-      console.log('[Session] Token refreshed and saved successfully!');
-    } catch (err) {
-      console.warn('[Session] Automatic refresh failed:', err.message);
-    } finally {
-      isRefreshing = null;
-    }
+async function ensureBrowser() {
+  if (page) return;
+  if (browserReady) return browserReady;
+  browserReady = (async () => {
+    console.log('[scraper] Launching persistent Playwright browser...');
+    browser = await chromium.launch({
+      headless: false,
+      args: ['--disable-blink-features=AutomationControlled', '--window-size=800,600']
+    });
+    const context = await browser.newContext({
+      ignoreHTTPSErrors: true
+    });
+    page = await context.newPage();
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    });
+    await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+    await page.waitForTimeout(6000);
+    console.log('[scraper] Browser ready. Cloudflare challenge passed.');
+    browserReady = null;
   })();
-  return isRefreshing;
+  return browserReady;
 }
 
-// ─── Axios instance ─────────────────────────────────────────────────────────
+async function browserFetch(apiPath, params = {}) {
+  await ensureBrowser();
 
-const api = axios.create({
-  baseURL: `${BASE}/api/v1`,
-  headers: {
-    Referer: `${BASE}/`,
-    Accept: 'application/json, text/plain, */*',
-  },
-  timeout: 15_000,
-});
-
-api.interceptors.request.use(async (cfg) => {
-  if (!cookiesHeader) {
-    const token = await db.getActiveToken();
-    if (token && token.cookie) {
-      cookiesHeader = token.cookie;
-      if (token.user_agent) userAgent = token.user_agent;
-    } else {
-      await refreshSession();
-    }
-  }
-
-  cfg.headers['Cookie'] = cookiesHeader;
-  cfg.headers['User-Agent'] = userAgent;
-
-  if ((cfg.method ?? 'get').toLowerCase() !== 'get') return cfg;
-  const params = cfg.params ?? {};
-  const url = cfg.url ?? '';
   const qs = Object.keys(params).filter(k => k !== '_').sort();
   const qsStr = qs.map(k => `${k}=${params[k]}`).join('&');
-  const fullPath = qsStr ? `${url}?${qsStr}` : url;
-  cfg.params = { ...params, _: getSignature(fullPath) };
-  return cfg;
-});
+  const sigPath = qsStr ? `${apiPath}?${qsStr}` : apiPath;
+  const sig = getSignature(sigPath);
+  const allParams = { ...params, _: sig };
+  const paramStr = new URLSearchParams(allParams).toString();
+  const targetUrl = `${BASE}/api/v1${apiPath}?${paramStr}`;
 
-api.interceptors.response.use((res) => {
-  let body = res.data;
-  if (res.headers?.['x-enc'] === '1' && body && typeof body === 'object' && typeof body.e === 'string') {
-    try {
-      body = JSON.parse(decryptResponse(body.e));
-    } catch { /* leave body as-is */ }
-  }
-  if (body && typeof body === 'object' && body.status === 'ok' && 'result' in body) {
-    res.data = body.result;
-  } else {
-    res.data = body;
-  }
-  return res;
-});
+  const result = await page.evaluate(async (url) => {
+    const r = await fetch(url, { headers: { 'Accept': 'application/json, text/plain, */*' } });
+    return { status: r.status, enc: r.headers.get('x-enc'), text: await r.text() };
+  }, targetUrl);
 
-async function requestWithRetry(fn) {
-  try {
-    return await fn();
-  } catch (err) {
-    if (err.response?.status === 403) {
-      console.log('[scraper] 403 detected! Refreshing session...');
-      await refreshSession();
-      return await fn();
-    }
-    throw err;
+  if (result.status === 403) {
+    console.log('[scraper] 403 detected. Re-solving Turnstile...');
+    await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await page.waitForTimeout(6000);
+    const retry = await page.evaluate(async (url) => {
+      const r = await fetch(url, { headers: { 'Accept': 'application/json, text/plain, */*' } });
+      return { status: r.status, enc: r.headers.get('x-enc'), text: await r.text() };
+    }, targetUrl);
+    if (retry.status !== 200) throw new Error(`comix.to returned ${retry.status}`);
+    return parseBody(retry);
   }
+
+  if (result.status !== 200) throw new Error(`comix.to returned ${result.status}`);
+  return parseBody(result);
+}
+
+function parseBody(result) {
+  let body = JSON.parse(result.text);
+  if (result.enc === '1' && body && typeof body.e === 'string') {
+    try { body = JSON.parse(decryptResponse(body.e)); } catch {}
+  }
+  if (body && body.status === 'ok' && 'result' in body) return body.result;
+  return body;
 }
 
 // ─── public helpers ─────────────────────────────────────────────────────────
 
-async function fetchBrowse(page = 1) {
-  return requestWithRetry(() => api.get('/manga', { params: { 'order[score]': 'desc', page } }).then(r => r.data));
+async function fetchBrowse(p = 1) {
+  return browserFetch('/manga', { 'order[score]': 'desc', page: p });
 }
 
-async function searchManga(query, page = 1) {
-  return requestWithRetry(() => api.get('/manga', { params: { keyword: query, page } }).then(r => r.data));
+async function searchManga(query, p = 1) {
+  return browserFetch('/manga', { keyword: query, page: p });
 }
 
 async function fetchMangaDetail(slug) {
-  return requestWithRetry(() => api.get(`/manga/${slug}`).then(r => r.data));
+  return browserFetch(`/manga/${slug}`);
 }
 
 async function fetchChapterPages(chapterId) {
-  return requestWithRetry(() => api.get(`/chapters/${chapterId}`).then(r => r.data));
+  return browserFetch(`/chapters/${chapterId}`);
 }
 
 async function fetchMangaChapters(slug) {
-  return requestWithRetry(async () => {
-    let allItems = [];
-    let page = 1;
-    let hasNext = true;
-    while (hasNext && page <= 10) {
-      const { data } = await api.get(`/manga/${slug}/chapters`, { params: { limit: 100, page } });
-      if (data && data.items) {
-        allItems = allItems.concat(data.items);
-        hasNext = data.meta?.hasNext || false;
-        page++;
-      } else {
-        hasNext = false;
-      }
+  let allItems = [];
+  let p = 1;
+  let hasNext = true;
+  while (hasNext && p <= 10) {
+    const data = await browserFetch(`/manga/${slug}/chapters`, { limit: 100, page: p });
+    if (data && data.items) {
+      allItems = allItems.concat(data.items);
+      hasNext = data.meta?.hasNext || false;
+      p++;
+    } else {
+      hasNext = false;
     }
-    return { items: allItems };
-  });
+  }
+  return { items: allItems };
 }
 
 async function streamImage(imageUrl) {
-  return requestWithRetry(() =>
-    axios.get(imageUrl, {
-      responseType: 'stream',
-      headers: {
-        Referer: `${BASE}/`,
-        'User-Agent': userAgent,
-        ...(cookiesHeader ? { Cookie: cookiesHeader } : {})
-      },
-      timeout: 30_000,
-    })
-  );
+  await ensureBrowser();
+
+  const response = await page.context().request.get(imageUrl, {
+    headers: {
+      'Referer': `${BASE}/`
+    },
+    timeout: 30000
+  });
+
+  if (!response.ok()) {
+    throw new Error(`streamImage failed with status ${response.status()}`);
+  }
+
+  // Convert Playwright APIResponse to Node.js Readable stream wrapper
+  const buffer = await response.body();
+  const headers = response.headers();
+  const { Readable } = require('stream');
+
+  return {
+    headers: headers,
+    data: Readable.from(buffer)
+  };
 }
 
 module.exports = {
-  setSession: (cookie, ua) => { cookiesHeader = cookie; if (ua) userAgent = ua; },
   fetchBrowse,
   searchManga,
   fetchMangaDetail,

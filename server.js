@@ -43,7 +43,9 @@ app.post('/api/admin/token', async (req, res) => {
     if (!cookie) return res.status(400).json({ error: 'Cookie string is required' });
     
     const saved = await db.saveToken(cookie, user_agent);
-    scraper.setSession(saved.cookie, saved.user_agent);
+    if (typeof scraper.setSession === 'function') {
+      scraper.setSession(saved.cookie, saved.user_agent);
+    }
     
     res.json({ status: 'ok', message: 'Token saved successfully', token: saved });
   } catch (err) {
