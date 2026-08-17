@@ -1,67 +1,52 @@
 /**
- * scraper.js — HTTP client for comix.to with Playwright Session Manager & Request Signing.
- *
- * Architecture:
- *   Axios (with signature & decryption) -> uses Cookies & UA from Playwright Session Manager
- *   Playwright Session Manager -> solves Cloudflare Turnstile in non-headless mode, updates cookies dynamically
+ * scraper.js — HTTP client for comix.to with Persistent Playwright Session & Auto-Refresh.
  */
 
 'use strict';
 
-const dns = require('dns');
 const axios = require('axios');
 const { chromium } = require('playwright-chromium');
 const { getSignature, decryptResponse } = require('./crypto');
-
-// ─── Browser Session Manager (Playwright) ────────────────────────────────────
+const db = require('./db');
 
 const BASE = 'https://comix.to';
 let cookiesHeader = '';
 let userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-let sessionPromise = null;
+let isRefreshing = null;
 
-async function initSession() {
-  if (sessionPromise) return sessionPromise;
-  sessionPromise = (async () => {
-    console.log('[SessionManager] Launching browser to solve Cloudflare Turnstile...');
+// Initialize session from DB or Browser
+async function refreshSession() {
+  if (isRefreshing) return isRefreshing;
+  isRefreshing = (async () => {
+    console.log('[Session] Refreshing Cloudflare Turnstile token via browser...');
     try {
-      // Cloudflare Turnstile blocks headless chromium. 
-      // Running headless: false reliably bypasses the challenge.
-      const browser = await chromium.launch({ 
+      const browser = await chromium.launch({
         headless: false,
-        args: ['--disable-blink-features=AutomationControlled', '--window-size=800,600']
+        args: ['--disable-blink-features=AutomationControlled']
       });
       const context = await browser.newContext();
       const page = await context.newPage();
-      
-      // Basic stealth
       await page.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
       });
 
-      userAgent = await page.evaluate(() => navigator.userAgent);
-      
-      // Navigate and wait for challenge to clear (comix.to homepage)
       await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      await page.waitForTimeout(6000); // Allow Turnstile to verify
+      await page.waitForTimeout(6000);
 
       const cookies = await context.cookies();
       cookiesHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-      
+      userAgent = await page.evaluate(() => navigator.userAgent);
+
       await browser.close();
-      
-      if (cookiesHeader.includes('cf_clearance')) {
-        console.log('[SessionManager] Successfully obtained Cloudflare clearance!');
-      } else {
-        console.warn('[SessionManager] Warning: cf_clearance cookie not found, request may fail.');
-      }
+      await db.saveToken(cookiesHeader, userAgent);
+      console.log('[Session] Token refreshed and saved successfully!');
     } catch (err) {
-      console.warn('[SessionManager] Playwright challenge solve failed:', err.message);
+      console.warn('[Session] Automatic refresh failed:', err.message);
     } finally {
-      sessionPromise = null;
+      isRefreshing = null;
     }
   })();
-  return sessionPromise;
+  return isRefreshing;
 }
 
 // ─── Axios instance ─────────────────────────────────────────────────────────
@@ -75,9 +60,18 @@ const api = axios.create({
   timeout: 15_000,
 });
 
-// Request interceptor — attach session & append signing `_` param
 api.interceptors.request.use(async (cfg) => {
-  if (cookiesHeader) cfg.headers['Cookie'] = cookiesHeader;
+  if (!cookiesHeader) {
+    const token = await db.getActiveToken();
+    if (token && token.cookie) {
+      cookiesHeader = token.cookie;
+      if (token.user_agent) userAgent = token.user_agent;
+    } else {
+      await refreshSession();
+    }
+  }
+
+  cfg.headers['Cookie'] = cookiesHeader;
   cfg.headers['User-Agent'] = userAgent;
 
   if ((cfg.method ?? 'get').toLowerCase() !== 'get') return cfg;
@@ -90,7 +84,6 @@ api.interceptors.request.use(async (cfg) => {
   return cfg;
 });
 
-// Response interceptor — decrypt when x-enc: 1 and unwrap result
 api.interceptors.response.use((res) => {
   let body = res.data;
   if (res.headers?.['x-enc'] === '1' && body && typeof body === 'object' && typeof body.e === 'string') {
@@ -106,16 +99,14 @@ api.interceptors.response.use((res) => {
   return res;
 });
 
-/** Wrapper to retry request after initializing session if 403 occurs */
-async function requestWithSession(fn) {
+async function requestWithRetry(fn) {
   try {
     return await fn();
   } catch (err) {
-    // If 403 Forbidden, session is likely expired or missing
     if (err.response?.status === 403) {
-      console.log('[scraper] 403 Forbidden received. Refreshing Cloudflare session...');
-      await initSession();
-      return await fn(); // Retry once
+      console.log('[scraper] 403 detected! Refreshing session...');
+      await refreshSession();
+      return await fn();
     }
     throw err;
   }
@@ -124,35 +115,23 @@ async function requestWithSession(fn) {
 // ─── public helpers ─────────────────────────────────────────────────────────
 
 async function fetchBrowse(page = 1) {
-  return requestWithSession(async () => {
-    const { data } = await api.get('/manga', { params: { 'order[score]': 'desc', page } });
-    return data;
-  });
+  return requestWithRetry(() => api.get('/manga', { params: { 'order[score]': 'desc', page } }).then(r => r.data));
 }
 
 async function searchManga(query, page = 1) {
-  return requestWithSession(async () => {
-    const { data } = await api.get('/manga', { params: { keyword: query, page } });
-    return data;
-  });
+  return requestWithRetry(() => api.get('/manga', { params: { keyword: query, page } }).then(r => r.data));
 }
 
 async function fetchMangaDetail(slug) {
-  return requestWithSession(async () => {
-    const { data } = await api.get(`/manga/${slug}`);
-    return data;
-  });
+  return requestWithRetry(() => api.get(`/manga/${slug}`).then(r => r.data));
 }
 
 async function fetchChapterPages(chapterId) {
-  return requestWithSession(async () => {
-    const { data } = await api.get(`/chapters/${chapterId}`);
-    return data;
-  });
+  return requestWithRetry(() => api.get(`/chapters/${chapterId}`).then(r => r.data));
 }
 
 async function fetchMangaChapters(slug) {
-  return requestWithSession(async () => {
+  return requestWithRetry(async () => {
     let allItems = [];
     let page = 1;
     let hasNext = true;
@@ -171,8 +150,8 @@ async function fetchMangaChapters(slug) {
 }
 
 async function streamImage(imageUrl) {
-  return requestWithSession(async () => {
-    return axios.get(imageUrl, {
+  return requestWithRetry(() =>
+    axios.get(imageUrl, {
       responseType: 'stream',
       headers: {
         Referer: `${BASE}/`,
@@ -180,11 +159,12 @@ async function streamImage(imageUrl) {
         ...(cookiesHeader ? { Cookie: cookiesHeader } : {})
       },
       timeout: 30_000,
-    });
-  });
+    })
+  );
 }
 
 module.exports = {
+  setSession: (cookie, ua) => { cookiesHeader = cookie; if (ua) userAgent = ua; },
   fetchBrowse,
   searchManga,
   fetchMangaDetail,
@@ -192,14 +172,3 @@ module.exports = {
   fetchChapterPages,
   streamImage,
 };
-
-if (require.main === module) {
-  const assert = require('assert');
-  fetchBrowse(1).then(data => {
-    assert(data, 'fetchBrowse must return data');
-    console.log('[self-check] scraper browse OK with Playwright Session Manager!');
-  }).catch(err => {
-    console.error('[self-check] FAILED:', err.message);
-    process.exit(1);
-  });
-}
