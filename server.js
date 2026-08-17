@@ -24,35 +24,6 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-const db = require('./db');
-
-// ─── Admin Token Routes ──────────────────────────────────────────────────────
-
-app.get('/api/admin/token', async (_req, res) => {
-  try {
-    const token = await db.getActiveToken();
-    res.json(token || { cookie: '', user_agent: '' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/admin/token', async (req, res) => {
-  try {
-    const { cookie, user_agent } = req.body;
-    if (!cookie) return res.status(400).json({ error: 'Cookie string is required' });
-    
-    const saved = await db.saveToken(cookie, user_agent);
-    if (typeof scraper.setSession === 'function') {
-      scraper.setSession(saved.cookie, saved.user_agent);
-    }
-    
-    res.json({ status: 'ok', message: 'Token saved successfully', token: saved });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ─── API routes ─────────────────────────────────────────────────────────────
 
 /** Browse / trending */

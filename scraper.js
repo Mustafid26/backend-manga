@@ -54,7 +54,7 @@ async function ensureBrowser() {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
     });
     await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(6000);
     console.log('[scraper] Browser ready.');
     browserReady = null;
   })();
