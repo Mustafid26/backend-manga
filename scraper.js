@@ -30,13 +30,21 @@ let page = null;
 let browserReady = null;
 
 async function ensureBrowser() {
-  if (page) return;
+  if (page && !page.isClosed()) return;
+  page = null;
   if (browserReady) return browserReady;
   browserReady = (async () => {
-    console.log('[scraper] Launching persistent Playwright browser...');
+    const isHeadless = process.env.RENDER || process.env.NODE_ENV === 'production' || process.platform === 'linux';
+    console.log(`[scraper] Launching Playwright browser (headless: ${isHeadless})...`);
     browser = await chromium.launch({
-      headless: false,
-      args: ['--disable-blink-features=AutomationControlled', '--window-size=800,600']
+      headless: isHeadless,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
     });
     const context = await browser.newContext({
       ignoreHTTPSErrors: true
@@ -46,8 +54,8 @@ async function ensureBrowser() {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
     });
     await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
-    await page.waitForTimeout(6000);
-    console.log('[scraper] Browser ready. Cloudflare challenge passed.');
+    await page.waitForTimeout(5000);
+    console.log('[scraper] Browser ready.');
     browserReady = null;
   })();
   return browserReady;
